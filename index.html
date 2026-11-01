@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Wave</title>
+  <style>
+    :root {
+      color-scheme: light;
+      background: #fff;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #fff;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="wave" aria-label="Interactive moving points"></canvas>
+
+  <script>
+    // Time needed for a point to travel upward by 100vh.
+    const SECONDS_PER_100VH = 2;
+
+    // The baseline is inset by this many viewport-height units on every side.
+    const LINE_INSET_VH = 5;
+
+    // How close to the baseline a gesture must begin.
+    const LINE_TOUCH_TOLERANCE_PX = 24;
+
+    // Distance between points created while dragging.
+    const POINT_SPACING_PX = 4;
+
+    // After the finger stops moving, the wave eases to a stop over this time.
+    const MOTION_FADE_SECONDS = 0.5;
+
+    const canvas = document.getElementById('wave');
+    const ctx = canvas.getContext('2d');
+
+    let width = 0;
+    let height = 0;
+    let pixelRatio = 1;
+    let baselineY = 0;
+    let lineInset = 0;
+    let points = [];
+    let activePointerId = null;
+    let lastPointerPosition = null;
+    let lastMovementTime = -Infinity;
+    let lastFrameTime = null;
+    let travelOffset = 0;
+
+    function resize() {
+      const rect = canvas.getBoundingClientRect();
+      width = rect.width;
+      height = rect.height;
+      pixelRatio = Math.max(1, window.devicePixelRatio || 1);
+
+      canvas.width = Math.round(width * pixelRatio);
+      canvas.height = Math.round(height * pixelRatio);
+      ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+
+      lineInset = height * LINE_INSET_VH / 100;
+      baselineY = height - lineInset;
+    }
+
+    function getPosition(event) {
+      const rect = canvas.getBoundingClientRect();
+      return {
+        x: event.clientX - rect.left,
+        y: event.clientY - rect.top
+      };
+    }
+
+    function isOnBaseline(position) {
+      return (
+        position.x >= lineInset - LINE_TOUCH_TOLERANCE_PX &&
+        position.x <= width - lineInset + LINE_TOUCH_TOLERANCE_PX &&
+        Math.abs(position.y - baselineY) <= LINE_TOUCH_TOLERANCE_PX
+      );
+    }
+
+    function addPoint(x) {
+      // Store the baseline position in the current wave coordinate system.
+      // This makes every new point appear on the line, even after earlier
+      // points have already moved upwards.
+      points.push({ x, y: baselineY + travelOffset });
+    }
+
+    function addDragPoints(from, to) {
+      const dx = to.x - from.x;
+      const dy = to.y - from.y;
+      const distance = Math.hypot(dx, dy);
+      const steps = Math.max(1, Math.floor(distance / POINT_SPACING_PX));
+
+      for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        addPoint(from.x + dx * t);
+      }
+    }
+
+    function handlePointerDown(event) {
+      if (activePointerId !== null) return;
+
+      const position = getPosition(event);
+      if (!isOnBaseline(position)) return;
+
+      event.preventDefault();
+      activePointerId = event.pointerId;
+      lastPointerPosition = position;
+      canvas.setPointerCapture(event.pointerId);
+      addPoint(position.x);
+    }
+
+    function handlePointerMove(event) {
+      if (event.pointerId !== activePointerId || !lastPointerPosition) return;
+
+      event.preventDefault();
+      const position = getPosition(event);
+      const distance = Math.hypot(
+        position.x - lastPointerPosition.x,
+        position.y - lastPointerPosition.y
+      );
+
+      if (distance > 0.5) {
+        // Any real finger movement drives the wave, even if it is too small
+        // to create another point yet.
+        lastMovementTime = performance.now();
+      }
+
+      if (distance >= POINT_SPACING_PX) {
+        addDragPoints(lastPointerPosition, position);
+        lastPointerPosition = position;
+      }
+    }
+
+    function endPointer(event) {
+      if (event.pointerId !== activePointerId) return;
+      activePointerId = null;
+      lastPointerPosition = null;
+    }
+
+    function draw(time) {
+      ctx.clearRect(0, 0, width, height);
+
+      // Advance the wave only while the user is moving a finger/mouse.
+      // When movement stops, ease the speed down over MOTION_FADE_SECONDS.
+      const deltaSeconds = lastFrameTime === null
+        ? 0
+        : Math.min((time - lastFrameTime) / 1000, 0.05);
+      lastFrameTime = time;
+
+      const idleSeconds = (time - lastMovementTime) / 1000;
+      const fade = Math.max(0, 1 - idleSeconds / MOTION_FADE_SECONDS);
+      const motionFactor = fade * fade * (3 - 2 * fade); // smoothstep
+      const speed = height / SECONDS_PER_100VH / 2;
+      travelOffset += speed * deltaSeconds * motionFactor;
+
+      // Keep points until they have moved completely out of view.
+      points = points.filter(point => point.y - travelOffset > -8);
+
+      const visiblePoints = points.map(point => ({
+        x: point.x,
+        y: point.y - travelOffset
+      }));
+
+      // Join every point to the next one.
+      if (visiblePoints.length > 1) {
+        ctx.beginPath();
+        ctx.moveTo(visiblePoints[0].x, visiblePoints[0].y);
+        for (let i = 1; i < visiblePoints.length; i++) {
+          ctx.lineTo(visiblePoints[i].x, visiblePoints[i].y);
+        }
+        ctx.strokeStyle = '#000';
+        ctx.lineWidth = 1.6;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.stroke();
+      }
+
+      // Draw the points themselves.
+      ctx.fillStyle = '#000';
+      for (const point of visiblePoints) {
+        ctx.beginPath();
+        ctx.arc(point.x, point.y, 2.3, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // The fixed line at the bottom.
+      ctx.beginPath();
+      ctx.moveTo(lineInset, baselineY);
+      ctx.lineTo(width - lineInset, baselineY);
+      ctx.strokeStyle = '#000';
+      ctx.lineWidth = 1.8;
+      ctx.lineCap = 'butt';
+      ctx.stroke();
+
+      requestAnimationFrame(draw);
+    }
+
+    canvas.addEventListener('pointerdown', handlePointerDown);
+    canvas.addEventListener('pointermove', handlePointerMove);
+    canvas.addEventListener('pointerup', endPointer);
+    canvas.addEventListener('pointercancel', endPointer);
+    window.addEventListener('resize', resize);
+
+    resize();
+    requestAnimationFrame(draw);
+  </script>
+</body>
+</html>
