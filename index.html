@@ -79,7 +79,8 @@
 
   <script>
     // Time needed for a point to travel upward by 100vh.
-    const SECONDS_PER_100VH = 2;
+    // (2 s = 100 % speed; divided by 0.7 → 70 % speed.)
+    const SECONDS_PER_100VH = 2 / 0.7;
 
     // The baseline is inset by this many viewport-height units on every side.
     const LINE_INSET_VH = 5;
@@ -186,9 +187,8 @@
 
     // ---------- Drawing ----------
 
-    function addPoint(x) {
-      // Store the baseline position in the current wave coordinate system.
-      const y = baselineY + travelOffset;
+    function addPoint(x, y = baselineY + travelOffset) {
+      // y is stored in the wave coordinate system (defaults to the baseline now).
       currentStroke.push({ x, y });
       if (y < minStoredY) minStoredY = y;
     }
@@ -199,9 +199,16 @@
       const distance = Math.hypot(dx, dy);
       const steps = Math.max(1, Math.floor(distance / POINT_SPACING_PX));
 
+      // Spread the in-between points vertically between the previous point
+      // and the current baseline, so a burst of points isn't stacked at one
+      // height (that caused the staircase look).
+      const prev = currentStroke[currentStroke.length - 1];
+      const fromY = prev ? prev.y : baselineY + travelOffset;
+      const toY = baselineY + travelOffset;
+
       for (let i = 1; i <= steps; i++) {
         const t = i / steps;
-        addPoint(from.x + dx * t);
+        addPoint(from.x + dx * t, fromY + (toY - fromY) * t);
       }
     }
 
@@ -347,13 +354,21 @@
         const lastY = stroke[stroke.length - 1].y - viewOffset;
         if (lastY < -8 || firstY > height + 8) continue;
 
-        // Join points only inside this stroke.
+        // Join points only inside this stroke, with a smooth curve:
+        // quadratic segments through the midpoints between points.
         if (stroke.length > 1) {
           ctx.beginPath();
           ctx.moveTo(stroke[0].x, firstY);
-          for (let i = 1; i < stroke.length; i++) {
-            ctx.lineTo(stroke[i].x, stroke[i].y - viewOffset);
+          for (let i = 1; i < stroke.length - 1; i++) {
+            const p = stroke[i];
+            const n = stroke[i + 1];
+            ctx.quadraticCurveTo(
+              p.x, p.y - viewOffset,
+              (p.x + n.x) / 2, (p.y + n.y) / 2 - viewOffset
+            );
           }
+          const last = stroke[stroke.length - 1];
+          ctx.lineTo(last.x, last.y - viewOffset);
           ctx.stroke();
         }
 
