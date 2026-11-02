@@ -21,6 +21,7 @@
       margin: 0;
       overflow: hidden;
       background: #fff;
+      overscroll-behavior: none;
     }
 
     canvas {
@@ -31,10 +32,50 @@
       user-select: none;
       -webkit-user-select: none;
     }
+
+    /* Soft edges: progressive blur + fade to white, top and below the baseline. */
+    .edge {
+      position: fixed;
+      left: 0;
+      right: 0;
+      pointer-events: none;
+    }
+
+    .edge .blur {
+      position: absolute;
+      inset: 0;
+      -webkit-backdrop-filter: blur(4px);
+      backdrop-filter: blur(4px);
+    }
+
+    .edge .fade {
+      position: absolute;
+      inset: 0;
+    }
+
+    #edge-top { top: 0; }
+    #edge-top .blur {
+      -webkit-mask-image: linear-gradient(to top, transparent, #000);
+      mask-image: linear-gradient(to top, transparent, #000);
+    }
+    #edge-top .fade {
+      background: linear-gradient(to top, rgba(255,255,255,0), #fff);
+    }
+
+    #edge-bottom { bottom: 0; }
+    #edge-bottom .blur {
+      -webkit-mask-image: linear-gradient(to bottom, transparent, #000);
+      mask-image: linear-gradient(to bottom, transparent, #000);
+    }
+    #edge-bottom .fade {
+      background: linear-gradient(to bottom, rgba(255,255,255,0), #fff);
+    }
   </style>
 </head>
 <body>
   <canvas id="wave" aria-label="Interactive moving points"></canvas>
+  <div class="edge" id="edge-top"><div class="blur"></div><div class="fade"></div></div>
+  <div class="edge" id="edge-bottom"><div class="blur"></div><div class="fade"></div></div>
 
   <script>
     // Time needed for a point to travel upward by 100vh.
@@ -52,6 +93,17 @@
     // After the finger stops moving, the wave eases to a stop over this time.
     const MOTION_FADE_SECONDS = 0.5;
 
+    // Scrolling through the history.
+    const SCROLL_FRICTION = 4;          // higher = momentum dies faster
+    const SCROLL_RETURN_SPEED = 10;     // how fast the view snaps back when drawing starts
+    const SCROLLBAR_FADE_SECONDS = 1.2;
+
+    // Height of the soft blurred/faded edge at the top of the screen.
+    const TOP_EDGE_VH = 8;
+
+    const edgeTop = document.getElementById('edge-top');
+    const edgeBottom = document.getElementById('edge-bottom');
+
     const canvas = document.getElementById('wave');
     const ctx = canvas.getContext('2d');
 
@@ -60,12 +112,26 @@
     let pixelRatio = 1;
     let baselineY = 0;
     let lineInset = 0;
-    let points = [];
+
+    // Each stroke is one continuous drag; points are joined only within a stroke.
+    let strokes = [];
+    let currentStroke = null;
+    let minStoredY = Infinity;
+
+    // Drawing gesture.
     let activePointerId = null;
     let lastPointerPosition = null;
     let lastMovementTime = -Infinity;
     let lastFrameTime = null;
     let travelOffset = 0;
+
+    // Scrolling gesture.
+    let scrollOffset = 0;      // > 0 means looking back at older (higher) points
+    let scrollVelocity = 0;    // px per second
+    let panPointerId = null;
+    let panLastY = 0;
+    let panLastTime = 0;
+    let lastScrollActivity = -Infinity;
 
     function resize() {
       const rect = canvas.getBoundingClientRect();
@@ -79,6 +145,10 @@
 
       lineInset = height * LINE_INSET_VH / 100;
       baselineY = height - lineInset;
+
+      // Bottom edge starts just under the baseline and covers the rest.
+      edgeBottom.style.height = Math.max(0, height - baselineY - 1) + 'px';
+      edgeTop.style.height = (height * TOP_EDGE_VH / 100) + 'px';
     }
 
     function getPosition(event) {
@@ -97,11 +167,30 @@
       );
     }
 
+    // ---------- Scrolling ----------
+
+    function maxScroll() {
+      if (minStoredY === Infinity) return 0;
+      // Allow scrolling until the oldest point sits just below the top edge.
+      const topmostScreenY = minStoredY - travelOffset;
+      return Math.max(0, lineInset - topmostScreenY);
+    }
+
+    function setScroll(value) {
+      const max = maxScroll();
+      const clamped = Math.min(max, Math.max(0, value));
+      if (clamped !== value) scrollVelocity = 0;
+      scrollOffset = clamped;
+      lastScrollActivity = performance.now();
+    }
+
+    // ---------- Drawing ----------
+
     function addPoint(x) {
       // Store the baseline position in the current wave coordinate system.
-      // This makes every new point appear on the line, even after earlier
-      // points have already moved upwards.
-      points.push({ x, y: baselineY + travelOffset });
+      const y = baselineY + travelOffset;
+      currentStroke.push({ x, y });
+      if (y < minStoredY) minStoredY = y;
     }
 
     function addDragPoints(from, to) {
@@ -116,20 +205,52 @@
       }
     }
 
+    // ---------- Pointer handling ----------
+
     function handlePointerDown(event) {
-      if (activePointerId !== null) return;
+      if (activePointerId !== null || panPointerId !== null) return;
 
       const position = getPosition(event);
-      if (!isOnBaseline(position)) return;
-
       event.preventDefault();
-      activePointerId = event.pointerId;
-      lastPointerPosition = position;
       canvas.setPointerCapture(event.pointerId);
-      addPoint(position.x);
+
+      if (isOnBaseline(position)) {
+        // Start a new, separate stroke.
+        activePointerId = event.pointerId;
+        lastPointerPosition = position;
+        currentStroke = [];
+        strokes.push(currentStroke);
+        scrollVelocity = 0;
+        addPoint(position.x);
+      } else {
+        // Anywhere else: drag to scroll through what was drawn.
+        panPointerId = event.pointerId;
+        panLastY = position.y;
+        panLastTime = performance.now();
+        scrollVelocity = 0;
+        lastScrollActivity = panLastTime;
+      }
     }
 
     function handlePointerMove(event) {
+      if (event.pointerId === panPointerId) {
+        event.preventDefault();
+        const position = getPosition(event);
+        const now = performance.now();
+        const dy = position.y - panLastY;
+        const dt = Math.max(1, now - panLastTime) / 1000;
+
+        setScroll(scrollOffset + dy);
+
+        // Smoothed velocity for momentum after release.
+        const instant = dy / dt;
+        scrollVelocity = scrollVelocity * 0.6 + instant * 0.4;
+
+        panLastY = position.y;
+        panLastTime = now;
+        return;
+      }
+
       if (event.pointerId !== activePointerId || !lastPointerPosition) return;
 
       event.preventDefault();
@@ -140,8 +261,6 @@
       );
 
       if (distance > 0.5) {
-        // Any real finger movement drives the wave, even if it is too small
-        // to create another point yet.
         lastMovementTime = performance.now();
       }
 
@@ -152,55 +271,99 @@
     }
 
     function endPointer(event) {
+      if (event.pointerId === panPointerId) {
+        panPointerId = null;
+        // If the finger rested before lifting, don't fling.
+        if (performance.now() - panLastTime > 80) scrollVelocity = 0;
+        return;
+      }
+
       if (event.pointerId !== activePointerId) return;
       activePointerId = null;
       lastPointerPosition = null;
+      currentStroke = null; // next touch starts a new, unconnected stroke
     }
+
+    function handleWheel(event) {
+      event.preventDefault();
+      if (activePointerId !== null) return;
+
+      let delta = event.deltaY;
+      if (event.deltaMode === 1) delta *= 16;
+      else if (event.deltaMode === 2) delta *= height;
+
+      scrollVelocity = 0;
+      // Wheel up = look back at older points above.
+      setScroll(scrollOffset - delta);
+    }
+
+    // ---------- Render loop ----------
 
     function draw(time) {
       ctx.clearRect(0, 0, width, height);
 
-      // Advance the wave only while the user is moving a finger/mouse.
-      // When movement stops, ease the speed down over MOTION_FADE_SECONDS.
       const deltaSeconds = lastFrameTime === null
         ? 0
         : Math.min((time - lastFrameTime) / 1000, 0.05);
       lastFrameTime = time;
 
+      // Advance the wave only while the user is moving a finger/mouse.
       const idleSeconds = (time - lastMovementTime) / 1000;
       const fade = Math.max(0, 1 - idleSeconds / MOTION_FADE_SECONDS);
       const motionFactor = fade * fade * (3 - 2 * fade); // smoothstep
-      const speed = height / SECONDS_PER_100VH / 2;
+      const speed = height / SECONDS_PER_100VH;
       travelOffset += speed * deltaSeconds * motionFactor;
 
-      // Keep points until they have moved completely out of view.
-      points = points.filter(point => point.y - travelOffset > -8);
-
-      const visiblePoints = points.map(point => ({
-        x: point.x,
-        y: point.y - travelOffset
-      }));
-
-      // Join every point to the next one.
-      if (visiblePoints.length > 1) {
-        ctx.beginPath();
-        ctx.moveTo(visiblePoints[0].x, visiblePoints[0].y);
-        for (let i = 1; i < visiblePoints.length; i++) {
-          ctx.lineTo(visiblePoints[i].x, visiblePoints[i].y);
+      // Scroll state.
+      if (activePointerId !== null) {
+        // While drawing, glide the view back to the present.
+        if (scrollOffset > 0) {
+          scrollOffset *= Math.exp(-deltaSeconds * SCROLL_RETURN_SPEED);
+          if (scrollOffset < 0.5) scrollOffset = 0;
+          lastScrollActivity = time;
         }
-        ctx.strokeStyle = '#000';
-        ctx.lineWidth = 1.6;
-        ctx.lineCap = 'round';
-        ctx.lineJoin = 'round';
-        ctx.stroke();
+      } else if (panPointerId === null && scrollVelocity !== 0) {
+        // Momentum after a flick.
+        setScroll(scrollOffset + scrollVelocity * deltaSeconds);
+        scrollVelocity *= Math.exp(-deltaSeconds * SCROLL_FRICTION);
+        if (Math.abs(scrollVelocity) < 5) scrollVelocity = 0;
+      } else {
+        scrollOffset = Math.min(scrollOffset, maxScroll());
       }
 
-      // Draw the points themselves.
+      const viewOffset = travelOffset - scrollOffset;
+
+      ctx.strokeStyle = '#000';
       ctx.fillStyle = '#000';
-      for (const point of visiblePoints) {
-        ctx.beginPath();
-        ctx.arc(point.x, point.y, 2.3, 0, Math.PI * 2);
-        ctx.fill();
+      ctx.lineWidth = 1.6;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+
+      for (const stroke of strokes) {
+        if (stroke.length === 0) continue;
+
+        // Within a stroke, later points are lower on screen.
+        const firstY = stroke[0].y - viewOffset;
+        const lastY = stroke[stroke.length - 1].y - viewOffset;
+        if (lastY < -8 || firstY > height + 8) continue;
+
+        // Join points only inside this stroke.
+        if (stroke.length > 1) {
+          ctx.beginPath();
+          ctx.moveTo(stroke[0].x, firstY);
+          for (let i = 1; i < stroke.length; i++) {
+            ctx.lineTo(stroke[i].x, stroke[i].y - viewOffset);
+          }
+          ctx.stroke();
+        }
+
+        for (const point of stroke) {
+          const y = point.y - viewOffset;
+          if (y < -8 || y > height + 8) continue;
+          ctx.beginPath();
+          ctx.arc(point.x, y, 2.3, 0, Math.PI * 2);
+          ctx.fill();
+        }
       }
 
       // The fixed line at the bottom.
@@ -212,6 +375,27 @@
       ctx.lineCap = 'butt';
       ctx.stroke();
 
+      // Thin scroll indicator on the right edge.
+      const max = maxScroll();
+      const sinceScroll = (time - lastScrollActivity) / 1000;
+      const barAlpha = panPointerId !== null
+        ? 1
+        : Math.max(0, 1 - sinceScroll / SCROLLBAR_FADE_SECONDS);
+      if (max > 0 && barAlpha > 0) {
+        const contentHeight = height + max;
+        const thumbLength = Math.max(24, height * height / contentHeight);
+        const thumbY = (height - thumbLength) * (1 - scrollOffset / max);
+        ctx.globalAlpha = 0.35 * barAlpha;
+        ctx.fillStyle = '#000';
+        const barWidth = 3;
+        const x = width - barWidth - 3;
+        ctx.beginPath();
+        if (ctx.roundRect) ctx.roundRect(x, thumbY + 3, barWidth, thumbLength - 6, barWidth / 2);
+        else ctx.rect(x, thumbY + 3, barWidth, thumbLength - 6);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+
       requestAnimationFrame(draw);
     }
 
@@ -219,6 +403,7 @@
     canvas.addEventListener('pointermove', handlePointerMove);
     canvas.addEventListener('pointerup', endPointer);
     canvas.addEventListener('pointercancel', endPointer);
+    canvas.addEventListener('wheel', handleWheel, { passive: false });
     window.addEventListener('resize', resize);
 
     resize();
